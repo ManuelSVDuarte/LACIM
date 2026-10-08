@@ -1,0 +1,425 @@
+from __future__ import annotations
+
+import html
+import json
+import re
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from http.cookiejar import CookieJar
+from typing import Any
+
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
+
+
+class ShareExtractError(RuntimeError):
+    """Raised when a shared conversation cannot be fetched or parsed."""
+
+
+@dataclass(frozen=True)
+class ParsedShareUrl:
+    service: str
+    share_id: str
+    url: str
+
+
+class HttpClient:
+    def __init__(self, timeout: float = 40.0, user_agent: str = DEFAULT_USER_AGENT) -> None:
+        self.timeout = timeout
+        self.user_agent = user_agent
+        self.cookies = CookieJar()
+        self.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self.cookies))
+
+    def request(
+        self,
+        url: str,
+        *,
+        method: str = "GET",
+        data: bytes | None = None,
+        headers: dict[str, str] | None = None,
+        accept: str = "*/*",
+        referer: str | None = None,
+    ) -> bytes:
+        req_headers = {
+            "User-Agent": self.user_agent,
+            "Accept": accept,
+            "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+        }
+        if referer:
+            req_headers["Referer"] = referer
+        if headers:
+            req_headers.update(headers)
+        req = urllib.request.Request(url, data=data, headers=req_headers, method=method)
+        try:
+            with self.opener.open(req, timeout=self.timeout) as response:
+                return response.read()
+        except Exception as exc:  # urllib wraps useful network details in several exception types.
+            raise ShareExtractError(f"request failed for {url}: {exc}") from exc
+
+    def get_text(self, url: str, *, referer: str | None = None) -> str:
+        body = self.request(url, accept="text/html,application/xhtml+xml,*/*", referer=referer)
+        return body.decode("utf-8", errors="replace")
+
+    def get_json(self, url: str, *, referer: str | None = None) -> Any:
+        body = self.request(url, accept="application/json,*/*", referer=referer)
+        try:
+            return json.loads(body.decode("utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ShareExtractError(f"invalid JSON from {url}: {body[:200]!r}") from exc
+
+    def post_form(self, url: str, data: dict[str, str], *, referer: str | None = None) -> str:
+        encoded = urllib.parse.urlencode(data).encode("utf-8") + b"&"
+        origin = urllib.parse.urlunparse(urllib.parse.urlparse(url)._replace(path="", params="", query="", fragment=""))
+        body = self.request(
+            url,
+            method="POST",
+            data=encoded,
+            accept="*/*",
+            referer=referer,
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+                "Origin": origin,
+                "X-Same-Domain": "1",
+            },
+        )
+        return body.decode("utf-8", errors="replace")
+
+
+def detect_share_url(value: str) -> ParsedShareUrl | None:
+    parsed = urllib.parse.urlparse(value.strip())
+    host = parsed.netloc.lower()
+    parts = [part for part in parsed.path.split("/") if part]
+    clean_url = urllib.parse.urlunparse(parsed._replace(fragment=""))
+    if host in {"chatgpt.com", "www.chatgpt.com"} and len(parts) >= 2 and parts[0] == "share":
+        return ParsedShareUrl("chatgpt", parts[1], clean_url)
+    if host in {"claude.ai", "www.claude.ai"} and len(parts) >= 2 and parts[0] == "share":
+        return ParsedShareUrl("claude", parts[1], clean_url)
+    if host in {"gemini.google.com", "www.gemini.google.com"} and len(parts) >= 2 and parts[0] == "share":
+        return ParsedShareUrl("gemini", parts[1], clean_url)
+    return None
+
+
+def _require_supported(url: str) -> ParsedShareUrl:
+    parsed = detect_share_url(url)
+    if not parsed:
+        raise ShareExtractError("supported URLs: chatgpt.com/share, claude.ai/share, gemini.google.com/share")
+    return parsed
+
+
+def _title_from_html(raw_html: str) -> str | None:
+    match = re.search(r"<title>(.*?)</title>", raw_html, re.I | re.S)
+    if not match:
+        return None
+    title = html.unescape(re.sub(r"\s+", " ", match.group(1)).strip())
+    if title.startswith("ChatGPT - "):
+        title = title[len("ChatGPT - ") :]
+    return title or None
+
+
+def _iso_time(value: Any) -> str | None:
+    if value is None:
+        return None
+    try:
+        if isinstance(value, list) and value:
+            seconds = float(value[0]) + (float(value[1]) / 1_000_000_000 if len(value) > 1 and value[1] else 0)
+        elif isinstance(value, str) and re.match(r"^\d{4}-\d\d-\d\dT", value):
+            return value
+        else:
+            seconds = float(value)
+        return datetime.fromtimestamp(seconds, tz=timezone.utc).isoformat()
+    except (TypeError, ValueError, OSError):
+        return None
+
+
+def _message(role: str, content: str, *, timestamp: str | None = None, msg_id: Any = None, model: Any = None) -> dict[str, Any]:
+    return {
+        "role": role,
+        "content": content,
+        "timestamp": timestamp,
+        "id": None if msg_id is None else str(msg_id),
+        "model": None if model is None else str(model),
+    }
+
+
+def _conversation(service: str, parsed: ParsedShareUrl, title: str, messages: list[dict[str, Any]], metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+    if not messages:
+        raise ShareExtractError("no visible user/final assistant messages found")
+    return {
+        "service": service,
+        "share_id": parsed.share_id,
+        "source_url": parsed.url,
+        "title": title or parsed.share_id,
+        "messages": messages,
+        "metadata": metadata or {},
+    }
+
+
+def _extract_chatgpt_stream_table(raw_html: str) -> list[Any]:
+    for encoded_arg in re.findall(r'streamController\.enqueue\(("(?:\\.|[^"\\])*")\)', raw_html):
+        try:
+            chunk = json.loads(encoded_arg)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(chunk, str) or not chunk.lstrip().startswith("["):
+            continue
+        try:
+            table = json.loads(chunk)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(table, list) and table:
+            return table
+    raise ShareExtractError("ChatGPT streamController data was not found")
+
+
+def _decode_react_router_table(table: list[Any]) -> Any:
+    memo: dict[int, Any] = {}
+    resolving: set[int] = set()
+
+    def decode_value(value: Any) -> Any:
+        if isinstance(value, int):
+            return decode_ref(value)
+        if isinstance(value, list):
+            return [decode_value(item) for item in value]
+        if isinstance(value, dict):
+            out: dict[str, Any] = {}
+            for key, child in value.items():
+                decoded_key = decode_ref(int(key[1:])) if isinstance(key, str) and re.fullmatch(r"_\d+", key) else key
+                out[str(decoded_key)] = decode_value(child)
+            return out
+        return value
+
+    def decode_ref(index: int) -> Any:
+        if index == -5:
+            return None
+        if index < 0 or index >= len(table):
+            return None
+        if index in memo:
+            return memo[index]
+        if index in resolving:
+            return {"$ref": index}
+        resolving.add(index)
+        raw = table[index]
+        if isinstance(raw, list):
+            out: list[Any] = []
+            memo[index] = out
+            out.extend(decode_value(item) for item in raw)
+        elif isinstance(raw, dict):
+            out = {}
+            memo[index] = out
+            for key, child in raw.items():
+                decoded_key = decode_ref(int(key[1:])) if isinstance(key, str) and re.fullmatch(r"_\d+", key) else key
+                out[str(decoded_key)] = decode_value(child)
+        else:
+            out = raw
+            memo[index] = out
+        resolving.remove(index)
+        return out
+
+    return decode_ref(0)
+
+
+def _get_chatgpt_share_data(decoded_root: dict[str, Any]) -> dict[str, Any]:
+    loader = decoded_root.get("loaderData") or {}
+    for key, value in loader.items():
+        if key.startswith("routes/share.") and isinstance(value, dict):
+            data = (value.get("serverResponse") or {}).get("data")
+            if isinstance(data, dict):
+                return data
+    raise ShareExtractError("ChatGPT share data was not found in loaderData")
+
+
+def _chatgpt_content_to_text(content: dict[str, Any]) -> str:
+    content_type = content.get("content_type")
+    if content_type in {"text", "multimodal_text"}:
+        return "\n".join(str(part) for part in content.get("parts") or [] if isinstance(part, str))
+    if content_type == "code":
+        text = content.get("text") or "\n".join(str(part) for part in content.get("parts") or [] if part is not None)
+        language = content.get("language") or ""
+        return f"```{language}\n{text}\n```" if text else ""
+    return ""
+
+
+def _replace_chatgpt_references(text: str, references: Any) -> str:
+    result = text or ""
+    if isinstance(references, list):
+        replacements: list[tuple[str, str]] = []
+        for ref in references:
+            if not isinstance(ref, dict) or ref.get("type") == "sources_footnote":
+                continue
+            matched = ref.get("matched_text")
+            if not isinstance(matched, str) or not matched.strip():
+                continue
+            label = ref.get("name") or ref.get("alt") or "source"
+            urls: list[str] = []
+            for item in ref.get("items") or []:
+                if isinstance(item, dict) and item.get("url"):
+                    urls.append(item["url"])
+            urls.extend(url for url in ref.get("safe_urls") or [] if isinstance(url, str))
+            markdown = f"[{label}]({urls[0]})" if urls else str(label)
+            replacements.append((matched, markdown))
+        for matched, markdown in sorted(replacements, key=lambda item: len(item[0]), reverse=True):
+            result = result.replace(matched, markdown)
+    result = re.sub(r"filecite([^]+)", r"[file citation: \1]", result)
+    result = re.sub(r"cite([^]+)", r"[citation: \1]", result)
+    return result
+
+
+def _extract_chatgpt(parsed: ParsedShareUrl, client: HttpClient) -> dict[str, Any]:
+    raw_html = client.get_text(parsed.url)
+    data = _get_chatgpt_share_data(_decode_react_router_table(_extract_chatgpt_stream_table(raw_html)))
+    messages: list[dict[str, Any]] = []
+    for node in data.get("linear_conversation") or []:
+        message = (node or {}).get("message") or {}
+        metadata = message.get("metadata") or {}
+        if metadata.get("is_visually_hidden_from_conversation") or metadata.get("is_redacted"):
+            continue
+        role = (message.get("author") or {}).get("role")
+        content = message.get("content") or {}
+        content_type = content.get("content_type")
+        channel = message.get("channel")
+        if role == "user":
+            text = _chatgpt_content_to_text(content).strip()
+            if text:
+                messages.append(_message("user", text, timestamp=_iso_time(message.get("create_time")), msg_id=message.get("id")))
+        elif role == "assistant" and channel == "final" and content_type in {"text", "code"}:
+            text = _replace_chatgpt_references(_chatgpt_content_to_text(content), metadata.get("content_references")).strip()
+            if text:
+                model = metadata.get("model_slug") or metadata.get("default_model_slug") or data.get("default_model_slug")
+                messages.append(_message("assistant", text, timestamp=_iso_time(message.get("create_time")), msg_id=message.get("id"), model=model))
+    return _conversation("chatgpt", parsed, data.get("title") or _title_from_html(raw_html) or parsed.share_id, messages, {"default_model_slug": data.get("default_model_slug")})
+
+
+def _strip_think_blocks(text: str) -> str:
+    return re.sub(r"<think>[\s\S]*?</think>", "", text or "", flags=re.I).strip()
+
+
+def _extract_claude(parsed: ParsedShareUrl, client: HttpClient) -> dict[str, Any]:
+    api_url = f"https://claude.ai/api/chat_snapshots/{urllib.parse.quote(parsed.share_id)}?rendering_mode=messages&render_all_tools=true"
+    data = client.get_json(api_url, referer=parsed.url)
+    raw_messages = data.get("chat_messages") if isinstance(data, dict) else None
+    if not isinstance(raw_messages, list):
+        raise ShareExtractError("Claude snapshot messages were not found")
+    messages: list[dict[str, Any]] = []
+    for raw in raw_messages:
+        if not isinstance(raw, dict):
+            continue
+        sender = raw.get("sender")
+        role = "user" if sender == "human" else "assistant" if sender == "assistant" else None
+        if not role:
+            continue
+        parts = [part for part in raw.get("content") or [] if isinstance(part, dict)]
+        if role == "user":
+            text = "\n\n".join(str(part.get("text") or "") for part in parts if part.get("type") == "text").strip()
+        else:
+            tool_indices = [index for index, part in enumerate(parts) if part.get("type") in {"tool_use", "tool_result"}]
+            last_tool_index = max(tool_indices) if tool_indices else -1
+            chunks = []
+            for index, part in enumerate(parts):
+                if part.get("type") != "text":
+                    continue
+                if tool_indices and index < last_tool_index:
+                    continue
+                chunk = _strip_think_blocks(str(part.get("text") or ""))
+                if chunk:
+                    chunks.append(chunk)
+            text = "\n\n".join(chunks).strip()
+        if text:
+            messages.append(_message(role, text, timestamp=_iso_time(raw.get("created_at")), msg_id=raw.get("uuid"), model=raw.get("model") if role == "assistant" else None))
+    return _conversation("claude", parsed, data.get("snapshot_name") or parsed.share_id, messages, {"conversation_uuid": data.get("conversation_uuid"), "raw_api_url": api_url})
+
+
+def _extract_wiz_value(raw_html: str, key: str) -> str:
+    match = re.search(rf'"{re.escape(key)}"\s*:\s*"([^"]+)"', raw_html)
+    if not match:
+        raise ShareExtractError(f"Gemini WIZ_global_data.{key} was not found")
+    return match.group(1)
+
+
+def _parse_batchexecute_response(raw: str, rpcid: str) -> Any:
+    for line in raw.splitlines():
+        if not line.startswith("[["):
+            continue
+        try:
+            rows = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        for row in rows:
+            if isinstance(row, list) and len(row) >= 3 and row[0] == "wrb.fr" and row[1] == rpcid:
+                return None if row[2] is None else json.loads(row[2])
+    raise ShareExtractError(f"Gemini batchexecute payload {rpcid} was not found")
+
+
+def _gemini_prompt_text(prompt: Any) -> str:
+    if isinstance(prompt, list) and prompt and isinstance(prompt[0], list):
+        return "\n".join(str(item) for item in prompt[0] if item is not None)
+    return ""
+
+
+def _gemini_answer_text(answer_block: Any) -> tuple[str, str | None]:
+    if not isinstance(answer_block, list) or not answer_block:
+        return "", None
+    candidate = answer_block[0][0] if isinstance(answer_block[0], list) and answer_block[0] else None
+    if not isinstance(candidate, list):
+        return "", None
+    response_id = str(candidate[0]) if candidate and candidate[0] is not None else None
+    text = "\n".join(str(item) for item in candidate[1] if isinstance(item, str)) if len(candidate) > 1 and isinstance(candidate[1], list) else ""
+    return text, response_id
+
+
+def _extract_gemini(parsed: ParsedShareUrl, client: HttpClient) -> dict[str, Any]:
+    raw_html = client.get_text(parsed.url)
+    bl = _extract_wiz_value(raw_html, "cfb2h")
+    fsid = _extract_wiz_value(raw_html, "FdrFJe")
+    rpcid = "ujx1Bf"
+    query = urllib.parse.urlencode({"rpcids": rpcid, "source-path": f"/share/{parsed.share_id}", "bl": bl, "f.sid": fsid, "hl": "en-US", "_reqid": "325091", "rt": "c"})
+    endpoint = f"https://gemini.google.com/_/BardChatUi/data/batchexecute?{query}"
+    f_req = json.dumps([[[rpcid, json.dumps([None, parsed.share_id, [4]], separators=(",", ":")), None, "generic"]]], separators=(",", ":"))
+    payload = _parse_batchexecute_response(client.post_form(endpoint, {"f.req": f_req}, referer=parsed.url), rpcid)
+    root = payload[0] if isinstance(payload, list) and payload else None
+    if not isinstance(root, list) or not isinstance(root[1] if len(root) > 1 else None, list):
+        raise ShareExtractError("Gemini conversation turns were not found")
+    meta = root[2] if len(root) > 2 and isinstance(root[2], list) else []
+    title = meta[1] if len(meta) > 1 and isinstance(meta[1], str) and meta[1] else (_title_from_html(raw_html) or parsed.share_id)
+    messages: list[dict[str, Any]] = []
+    for turn in root[1]:
+        if not isinstance(turn, list) or len(turn) < 4:
+            continue
+        turn_ids = turn[0] if isinstance(turn[0], list) else []
+        turn_id = turn_ids[1] if len(turn_ids) > 1 else None
+        timestamp = _iso_time(turn[4] if len(turn) > 4 else None)
+        user_text = _gemini_prompt_text(turn[2]).strip()
+        if user_text:
+            messages.append(_message("user", user_text, timestamp=timestamp, msg_id=turn_id))
+        answer_text, response_id = _gemini_answer_text(turn[3])
+        if answer_text.strip():
+            messages.append(_message("assistant", answer_text.strip(), timestamp=timestamp, msg_id=response_id))
+    return _conversation("gemini", parsed, title, messages, {"rpcid": rpcid})
+
+
+def extract_share(url: str, *, client: HttpClient | None = None) -> dict[str, Any]:
+    parsed = _require_supported(url)
+    client = client or HttpClient()
+    if parsed.service == "chatgpt":
+        return _extract_chatgpt(parsed, client)
+    if parsed.service == "claude":
+        return _extract_claude(parsed, client)
+    if parsed.service == "gemini":
+        return _extract_gemini(parsed, client)
+    raise ShareExtractError(f"unsupported service: {parsed.service}")
+
+
+def to_markdown(conversation: dict[str, Any]) -> str:
+    lines = [f"# {conversation.get('title') or conversation['share_id']}", "", f"service: {conversation['service']}", f"source: {conversation['source_url']}", ""]
+    for index, message in enumerate(conversation.get("messages") or [], start=1):
+        lines.append(f"## {index}. {message.get('role')}")
+        if message.get("timestamp"):
+            lines.append(f"time: {message['timestamp']}")
+        if message.get("model"):
+            lines.append(f"model: {message['model']}")
+        lines.extend(["", message.get("content") or "", ""])
+    return "\n".join(lines)

@@ -1,0 +1,1 @@
+import{c as e,u as t}from"./index-CeFt8dRR.js";var n=t();function r(){return(0,n.jsx)(e,{})}export{r as component};

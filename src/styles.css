@@ -1,0 +1,97 @@
+@import "tailwindcss";
+
+@theme {
+  --color-bg: #f3efe6;
+  --color-sheet: #ffffff;
+  --color-surface: #fffdf8;
+  --color-ink: #1a2332;
+  --color-muted: #5c6675;
+  --color-primary: #0e6b56;
+  --color-primary-fg: #f3fff8;
+  --color-header: #14352c;
+  --color-header-fg: #f4efe4;
+  --color-gold: #c6a15a;
+  --color-accent: #b4532a;
+  --color-accent-fg: #fff8f4;
+  --color-line: #e4dacb;
+  --color-danger: #9f2d2d;
+  --color-ok-soft: #e5f4ee;
+  --color-warn-soft: #f8efe6;
+  --font-sans: "Outfit", ui-sans-serif, system-ui, sans-serif;
+  --font-display: "Fraunces", ui-serif, Georgia, serif;
+}
+
+@layer base {
+  html {
+    font-family: var(--font-sans);
+    background: var(--color-bg);
+    color: var(--color-ink);
+  }
+  body {
+    min-height: 100vh;
+    line-height: 1.5;
+  }
+  button:not(:disabled),
+  [role="button"]:not(:disabled) {
+    cursor: pointer;
+  }
+  :focus-visible {
+    outline: 2px solid var(--color-primary);
+    outline-offset: 2px;
+  }
+  h1,
+  h2,
+  h3 {
+    font-family: var(--font-display);
+    font-weight: 560;
+    letter-spacing: -0.02em;
+    line-height: 1.15;
+  }
+}
+
+.hero-scrim {
+  background: linear-gradient(to top, rgb(20 53 44 / 0.9), rgb(20 53 44 / 0.28) 58%);
+}
+
+@media (min-width: 40rem) {
+  .hero-scrim {
+    background: linear-gradient(
+      to right,
+      rgb(20 53 44 / 0.9) 0%,
+      rgb(20 53 44 / 0.62) 38%,
+      rgb(20 53 44 / 0.12) 68%
+    );
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation: none !important;
+    transition: none !important;
+  }
+}
+
+.print-only {
+  display: none;
+}
+
+@media print {
+  .no-print {
+    display: none !important;
+  }
+  .print-only {
+    display: block !important;
+  }
+  html,
+  body {
+    background: white;
+  }
+  .print-sheet {
+    color: #1a2332;
+  }
+  .page-break {
+    break-before: page;
+  }
+}
